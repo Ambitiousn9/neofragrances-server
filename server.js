@@ -14,8 +14,14 @@ if (!GOOGLE_CLIENT_ID) {
 }
 
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
-const { sendOrderConfirmation } = require("./mailer");
+const { sendOrderConfirmation, sendPasswordResetEmail } = require("./mailer");
 const app = express();
+
+// Render (and most PaaS hosts) sit behind a reverse proxy — trust the
+// X-Forwarded-For header so req.ip reflects the real client IP. This
+// matters for the password-reset rate limiter below.
+app.set("trust proxy", 1);
+
 app.use(cors());
 app.use(express.json());
 
@@ -674,54 +680,177 @@ app.post("/api/addresses", requireAuth, async (req, res) => {
   }
 });
 
+// ============================================================
+// ---------- Password Reset (real, email-based flow) ---------
+// ============================================================
+//
+// Security design:
+//  - The raw token is sent ONLY by email, never in an API response.
+//  - Only a SHA-256 hash of the token is stored in the database, so a
+//    leaked/stolen database dump can't be used to reset accounts.
+//  - Tokens expire after 1 hour and are single-use (marked used_at,
+//    and re-checked with `used_at IS NULL` on every lookup).
+//  - Requesting a new link invalidates any previous unused links for
+//    that user.
+//  - The forgot-password endpoint always returns the same generic
+//    message, whether or not the email is registered, so it can't be
+//    used to enumerate accounts.
+//  - Lightweight in-memory rate limiting/cooldown guards against abuse.
+//    This resets if the server restarts and isn't shared across
+//    multiple server instances — fine for this project's scale, but a
+//    production deployment on multiple instances should move this to
+//    something shared (e.g. express-rate-limit backed by Redis/DB).
+
+const RESET_IP_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const RESET_IP_MAX_REQUESTS = 5;           // per IP, per window
+const RESET_EMAIL_COOLDOWN_MS = 60 * 1000; // 60 seconds between requests for the same email
+
+const resetIpHits = new Map();         // ip -> [timestamps]
+const resetEmailCooldowns = new Map(); // normalizedEmail -> last request timestamp
+
+function isIpRateLimited(ip) {
+  const now = Date.now();
+  const hits = (resetIpHits.get(ip) || []).filter(t => now - t < RESET_IP_WINDOW_MS);
+  resetIpHits.set(ip, hits);
+  return hits.length >= RESET_IP_MAX_REQUESTS;
+}
+function recordIpRequest(ip) {
+  const hits = resetIpHits.get(ip) || [];
+  hits.push(Date.now());
+  resetIpHits.set(ip, hits);
+}
+function isEmailOnCooldown(email) {
+  const last = resetEmailCooldowns.get(email);
+  return !!last && (Date.now() - last) < RESET_EMAIL_COOLDOWN_MS;
+}
+function recordEmailCooldown(email) {
+  resetEmailCooldowns.set(email, Date.now());
+}
+// Periodic cleanup so these maps don't grow forever on a long-running process.
+setInterval(() => {
+  const now = Date.now();
+  for (const [email, ts] of resetEmailCooldowns) {
+    if (now - ts > RESET_EMAIL_COOLDOWN_MS) resetEmailCooldowns.delete(email);
+  }
+  for (const [ip, hits] of resetIpHits) {
+    const fresh = hits.filter(t => now - t < RESET_IP_WINDOW_MS);
+    if (fresh.length === 0) resetIpHits.delete(ip); else resetIpHits.set(ip, fresh);
+  }
+}, 60 * 60 * 1000).unref();
+
+function hashResetToken(rawToken) {
+  return crypto.createHash("sha256").update(rawToken).digest("hex");
+}
+
 // ---------- Forgot Password ----------
 app.post("/api/forgot-password", async (req, res) => {
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ error: "Email is required." });
+  const ip = req.ip;
+  const GENERIC = { message: "If an account exists with that email, we've sent you a password reset link." };
+
+  if (isIpRateLimited(ip)) {
+    return res.status(429).json({ error: "Too many requests. Please try again later." });
+  }
+  recordIpRequest(ip);
+
+  const email = (req.body?.email || "").trim();
+  if (!email) {
+    return res.status(400).json({ error: "Email is required." });
+  }
+
+  // Same-email cooldown: respond with the generic message either way,
+  // so a repeated submission never reveals whether the account exists.
+  if (isEmailOnCooldown(email)) {
+    return res.json(GENERIC);
+  }
+  recordEmailCooldown(email);
 
   try {
-    const [users] = await pool.query("SELECT id FROM users WHERE email = ?", [email]);
+    const [users] = await pool.query("SELECT id, full_name FROM users WHERE email = ?", [email]);
     if (users.length === 0) {
-      // Don't reveal whether the email exists — but since there's no real
-      // email service wired up, we also can't hand back a link in this case.
-      return res.json({ resetLink: null, message: "If that email exists, a reset link has been generated." });
+      return res.json(GENERIC);
     }
 
-    const userId = users[0].id;
-    const token = crypto.randomBytes(32).toString("hex");
+    const user = users[0];
+
+    // Invalidate any previous unused reset tokens for this user before
+    // issuing a new one.
+    await pool.query("DELETE FROM password_resets WHERE user_id = ? AND used_at IS NULL", [user.id]);
+
+    const rawToken = crypto.randomBytes(32).toString("hex");
+    const tokenHash = hashResetToken(rawToken);
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
 
-    await pool.query("INSERT INTO password_resets (user_id, token, expires_at) VALUES (?, ?, ?)", [userId, token, expiresAt]);
+    await pool.query(
+      "INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+      [user.id, tokenHash, expiresAt]
+    );
 
-    // NOTE: a real deployment would email this link, never return it directly.
-    // It's returned here only because no SMTP/email service is configured
-    // for this coursework project — this keeps the flow testable without one.
-    res.json({ resetLink: `reset-password.html?token=${token}` });
+    const resetUrl = `${process.env.FRONTEND_URL}/reset-password.html?token=${rawToken}`;
+
+    try {
+      await sendPasswordResetEmail({ to: email, customerName: user.full_name, resetUrl });
+    } catch (emailErr) {
+      // Never surface email-delivery failures to the client — that would
+      // leak whether the account exists, and could expose infra details.
+      console.error("Password reset email failed to send:", emailErr);
+    }
+
+    return res.json(GENERIC);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Something went wrong." });
+    return res.status(500).json({ error: "Something went wrong. Please try again." });
+  }
+});
+
+// ---------- Verify a reset token (used by reset-password.html on load) ----------
+app.get("/api/reset-password/verify", async (req, res) => {
+  const token = req.query?.token;
+  if (!token) return res.json({ valid: false });
+
+  try {
+    const tokenHash = hashResetToken(token);
+    const [rows] = await pool.query(
+      "SELECT id FROM password_resets WHERE token_hash = ? AND used_at IS NULL AND expires_at > NOW() LIMIT 1",
+      [tokenHash]
+    );
+    res.json({ valid: rows.length > 0 });
+  } catch (err) {
+    console.error(err);
+    res.json({ valid: false });
   }
 });
 
 // ---------- Reset Password ----------
 app.post("/api/reset-password", async (req, res) => {
   const { token, password } = req.body;
-  if (!token || !password) return res.status(400).json({ error: "Token and new password are required." });
-  if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters." });
+  if (!token || !password) {
+    return res.status(400).json({ error: "Token and new password are required." });
+  }
+  if (password.length < 6) {
+    return res.status(400).json({ error: "Password must be at least 6 characters." });
+  }
+
+  const INVALID = { error: "This password reset link is invalid or has expired. Please request a new one." };
 
   try {
+    const tokenHash = hashResetToken(token);
     const [rows] = await pool.query(
-      "SELECT * FROM password_resets WHERE token = ? AND expires_at > NOW() ORDER BY id DESC LIMIT 1",
-      [token]
+      "SELECT * FROM password_resets WHERE token_hash = ? AND used_at IS NULL AND expires_at > NOW() LIMIT 1",
+      [tokenHash]
     );
     if (rows.length === 0) {
-      return res.status(400).json({ error: "This reset link is invalid or has expired." });
+      return res.status(400).json(INVALID);
     }
 
     const resetRecord = rows[0];
     const passwordHash = await bcrypt.hash(password, 10);
+
     await pool.query("UPDATE users SET password_hash = ? WHERE id = ?", [passwordHash, resetRecord.user_id]);
-    await pool.query("DELETE FROM password_resets WHERE user_id = ?", [resetRecord.user_id]);
+
+    // Mark this token used (audit trail) and clear out any other stray
+    // unused tokens for this user so the link can never be reused.
+    await pool.query("UPDATE password_resets SET used_at = NOW() WHERE id = ?", [resetRecord.id]);
+    await pool.query("DELETE FROM password_resets WHERE user_id = ? AND used_at IS NULL", [resetRecord.user_id]);
 
     res.json({ success: true });
   } catch (err) {
