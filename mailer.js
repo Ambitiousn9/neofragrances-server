@@ -131,4 +131,47 @@ async function sendPasswordResetEmail({ to, customerName, resetUrl }) {
   });
 }
 
-module.exports = { sendOrderConfirmation, sendPasswordResetEmail };
+/**
+ * Sends the "verify your email" link shown right after registration.
+ * Like the password-reset email, the link is only ever sent here — never
+ * returned in an API response or rendered on screen.
+ */
+async function sendVerificationEmail({ to, customerName, verifyUrl }) {
+  const html = `
+  <div style="font-family: Arial, sans-serif; max-width:520px; margin:0 auto; color:#2B1B2E;">
+    <div style="background:#2B1B2E; padding:24px; text-align:center;">
+      <span style="font-size:22px; font-weight:bold; color:#fff;">Neo<span style="color:#B8935F;">Fragrances</span></span>
+    </div>
+    <div style="padding:32px 28px;">
+      <h2 style="margin-top:0; font-family: Georgia, serif;">Verify Your Email</h2>
+      <p style="color:#5C4A5E; line-height:1.6;">
+        Hi ${customerName || "there"}, thanks for creating a NeoFragrances account! Please confirm this is your
+        email address by clicking the button below. This link will expire in <strong>24 hours</strong>.
+      </p>
+      <div style="text-align:center; margin:32px 0;">
+        <a href="${verifyUrl}"
+           style="background:#6B2737; color:#ffffff; text-decoration:none; font-weight:bold; font-size:15px; padding:14px 34px; border-radius:6px; display:inline-block;">
+          Verify Email
+        </a>
+      </div>
+      <p style="color:#5C4A5E; font-size:13px; line-height:1.6;">
+        If the button above doesn't work, copy and paste this link into your browser:<br>
+        <a href="${verifyUrl}" style="color:#6B2737; word-break:break-all;">${verifyUrl}</a>
+      </p>
+      <p style="color:#5C4A5E; font-size:13px; margin-top:28px; padding-top:20px; border-top:1px solid #E4DAD0;">
+        If you didn't create a NeoFragrances account, you can safely ignore this email.
+      </p>
+    </div>
+    <div style="background:#FAF6F0; padding:16px; text-align:center; font-size:12px; color:#5C4A5E;">
+      &copy; 2026 NeoFragrances. All rights reserved.
+    </div>
+  </div>`;
+
+  await sendViaSendGrid({
+    to,
+    subject: "Verify Your NeoFragrances Email",
+    html,
+  });
+}
+
+module.exports = { sendOrderConfirmation, sendPasswordResetEmail, sendVerificationEmail };
