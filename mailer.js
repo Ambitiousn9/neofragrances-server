@@ -1,47 +1,51 @@
-// mailer.js — sends order confirmation and password-reset emails via Resend
+// mailer.js — sends order confirmation and password-reset emails via SendGrid
 //
-// WHY RESEND INSTEAD OF RAW SMTP: raw SMTP (Gmail, port 465/587) from
-// Render's free tier consistently times out (ETIMEDOUT on CONN) — the
-// TCP connection to Gmail's mail servers never completes, regardless of
-// port or IPv4/IPv6. This is a known pattern on PaaS free tiers, which
-// commonly restrict outbound SMTP while leaving normal HTTPS traffic
-// open. Resend sends over a plain HTTPS API call (port 443), which
-// sidesteps the problem entirely.
+// Uses SendGrid's Single Sender Verification (one verified email address,
+// no domain purchase/DNS required) rather than domain authentication.
+// This means real customers at any email provider can receive mail — the
+// earlier Resend sandbox restriction (recipient must match the Resend
+// signup email) does not apply here.
 //
-// No new npm dependency needed — this uses the same global `fetch()`
-// already used elsewhere in this project (see the Paystack calls in
-// server.js), just pointed at Resend's REST API instead.
+// Note: without full domain authentication (SPF/DKIM tied to a domain
+// you own), deliverability is solid but slightly more likely to land in
+// spam/junk on some providers than a fully authenticated domain would.
+// That's a SendGrid-documented tradeoff of single sender verification,
+// not a bug — fine for this project's current scale.
+//
+// No new npm dependency — this uses the same global `fetch()` already
+// used elsewhere in this project (see the Paystack calls in server.js).
 
-const RESEND_API_URL = "https://api.resend.com/emails";
+const SENDGRID_API_URL = "https://api.sendgrid.com/v3/mail/send";
+const FROM_EMAIL = process.env.SENDGRID_FROM_EMAIL;
+const FROM_NAME = "NeoFragrances";
 
-// Until a domain is verified in the Resend dashboard, Resend requires
-// sending FROM this sandbox address, and only allows sending TO the
-// email address the Resend account was signed up with. Once a domain is
-// verified (Resend → Domains), set RESEND_FROM_EMAIL to something like
-// "NeoFragrances <noreply@yourdomain.com>" — no code change needed.
-const FROM_EMAIL = process.env.RESEND_FROM_EMAIL || "NeoFragrances <onboarding@resend.dev>";
+async function sendViaSendGrid({ to, subject, html }) {
+  if (!process.env.SENDGRID_API_KEY) {
+    throw new Error("SENDGRID_API_KEY is not configured.");
+  }
+  if (!FROM_EMAIL) {
+    throw new Error("SENDGRID_FROM_EMAIL is not configured — set it to your verified Single Sender address.");
+  }
 
-async function sendViaResend({ to, subject, html }) {
-  const res = await fetch(RESEND_API_URL, {
+  const res = await fetch(SENDGRID_API_URL, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+      Authorization: `Bearer ${process.env.SENDGRID_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      from: FROM_EMAIL,
-      to,
+      personalizations: [{ to: [{ email: to }] }],
+      from: { email: FROM_EMAIL, name: FROM_NAME },
       subject,
-      html,
+      content: [{ type: "text/html", value: html }],
     }),
   });
 
+  // SendGrid returns 202 with an empty body on success — no res.json() to parse.
   if (!res.ok) {
     const errorBody = await res.text();
-    throw new Error(`Resend API error (${res.status}): ${errorBody}`);
+    throw new Error(`SendGrid API error (${res.status}): ${errorBody}`);
   }
-
-  return res.json();
 }
 
 async function sendOrderConfirmation({ to, customerName, orderId, items, total }) {
@@ -76,7 +80,7 @@ async function sendOrderConfirmation({ to, customerName, orderId, items, total }
     </div>
   </div>`;
 
-  await sendViaResend({
+  await sendViaSendGrid({
     to,
     subject: `Order Confirmation — #${orderId}`,
     html,
@@ -120,7 +124,7 @@ async function sendPasswordResetEmail({ to, customerName, resetUrl }) {
     </div>
   </div>`;
 
-  await sendViaResend({
+  await sendViaSendGrid({
     to,
     subject: "Reset Your NeoFragrances Password",
     html,
