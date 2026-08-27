@@ -1,12 +1,35 @@
 // mailer.js — sends order confirmation and password-reset emails via Gmail
 const nodemailer = require("nodemailer");
 
+// IMPORTANT: using explicit host/port/secure (instead of the `service:
+// "gmail"` shorthand) plus `family: 4` to force IPv4. Some hosts (Render
+// included) intermittently fail to route IPv6 to Gmail's SMTP endpoint,
+// which surfaces as ETIMEDOUT on the initial connection — nothing to do
+// with credentials. Explicit timeouts also make failures fail fast and
+// log clearly instead of hanging.
 const transporter = nodemailer.createTransport({
-  service: "gmail",
+  host: "smtp.gmail.com",
+  port: 465,
+  secure: true, // true for port 465, false for 587/STARTTLS
+  family: 4,    // force IPv4 — fixes ETIMEDOUT on some PaaS hosts
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_APP_PASSWORD,
   },
+  connectionTimeout: 15000, // 15s — fail fast instead of hanging for minutes
+  greetingTimeout: 15000,
+  socketTimeout: 15000,
+});
+
+// Verify the SMTP connection once at startup so connectivity problems show
+// up immediately in the logs, rather than only when a customer triggers
+// an email.
+transporter.verify((err) => {
+  if (err) {
+    console.error("Mailer SMTP connection check failed:", err.message);
+  } else {
+    console.log("Mailer SMTP connection OK — ready to send email.");
+  }
 });
 
 async function sendOrderConfirmation({ to, customerName, orderId, items, total }) {
