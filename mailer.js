@@ -9,9 +9,10 @@ const nodemailer = require("nodemailer");
 // log clearly instead of hanging.
 const transporter = nodemailer.createTransport({
   host: "smtp.gmail.com",
-  port: 465,
-  secure: true, // true for port 465, false for 587/STARTTLS
-  family: 4,    // force IPv4 — fixes ETIMEDOUT on some PaaS hosts
+  port: 587,
+  secure: false,   // STARTTLS on 587, not implicit TLS
+  requireTLS: true,
+  family: 4,        // force IPv4 — fixes ETIMEDOUT on some PaaS hosts
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_APP_PASSWORD,
