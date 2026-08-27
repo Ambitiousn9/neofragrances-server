@@ -6,6 +6,7 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
 const { OAuth2Client } = require("google-auth-library");
+const dns = require("dns").promises;
 const pool = require("./db");
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 
@@ -14,7 +15,7 @@ if (!GOOGLE_CLIENT_ID) {
 }
 
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
-const { sendOrderConfirmation, sendPasswordResetEmail } = require("./mailer");
+const { sendOrderConfirmation, sendPasswordResetEmail, sendVerificationEmail } = require("./mailer");
 const app = express();
 
 // Render (and most PaaS hosts) sit behind a reverse proxy — trust the
@@ -81,6 +82,11 @@ app.post("/api/register", async (req, res) => {
     return res.status(400).json({ error: "Password must be at least 6 characters." });
   }
 
+  const mailServerOk = await domainHasMailServer(email);
+  if (!mailServerOk) {
+    return res.status(400).json({ error: "We couldn't find a mail server for that email address. Please check it and try again." });
+  }
+
   try {
     const [existing] = await pool.query("SELECT id FROM users WHERE email = ?", [email]);
     if (existing.length > 0) {
@@ -93,10 +99,15 @@ app.post("/api/register", async (req, res) => {
       [fullName, email, phone || null, passwordHash]
     );
 
-    const user = { id: result.insertId, full_name: fullName, email, role: "customer" };
-    const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: "7d" });
+    const userId = result.insertId;
 
-    res.status(201).json({ token, user });
+    // Account is created but NOT logged in yet — email must be verified first.
+    await sendNewVerificationEmail({ userId, email, fullName });
+
+    res.status(201).json({
+      message: "Account created! Please check your email to verify your address before logging in.",
+      requiresVerification: true,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Something went wrong creating your account." });
@@ -121,6 +132,13 @@ app.post("/api/login", async (req, res) => {
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match) {
       return res.status(401).json({ error: "Invalid email or password." });
+    }
+
+    if (!user.email_verified_at) {
+      return res.status(403).json({
+        error: "Please verify your email before logging in. Check your inbox for the verification link.",
+        requiresVerification: true,
+      });
     }
 
     const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: "7d" });
@@ -206,10 +224,13 @@ app.post("/api/auth/google", async (req, res) => {
       const randomPassword = crypto.randomBytes(32).toString("hex");
       const passwordHash = await bcrypt.hash(randomPassword, 10);
 
+      // Google has already verified this email address (checked above via
+      // email_verified from the ID token), so this account skips the
+      // email-verification-link flow entirely.
       const [result] = await pool.query(
         `INSERT INTO users
-          (full_name, email, phone, password_hash, role)
-         VALUES (?, ?, ?, ?, 'customer')`,
+          (full_name, email, phone, password_hash, role, email_verified_at)
+         VALUES (?, ?, ?, ?, 'customer', NOW())`,
         [
           name || "NeoFragrances Customer",
           normalizedEmail,
@@ -677,6 +698,170 @@ app.post("/api/addresses", requireAuth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Could not save address." });
+  }
+});
+
+// ============================================================
+// ---------- Email Verification (real, email-based flow) -----
+// ============================================================
+//
+// Same security pattern as password reset below: only a SHA-256 hash of
+// the token is stored, tokens are single-use (used_at) and expire (24h —
+// longer than password reset since this is lower-risk and people often
+// don't check email right away after signing up).
+//
+// IMPORTANT — existing accounts: a migration (see migration-email-
+// verification.sql) sets email_verified_at = created_at for every
+// account that existed before this feature shipped, so no current
+// customer gets locked out. Only accounts created from here forward
+// need to click the link.
+
+const VERIFY_TOKEN_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+async function domainHasMailServer(email) {
+  const domain = (email || "").split("@")[1];
+  if (!domain) return false;
+  try {
+    const records = await dns.resolveMx(domain);
+    return Array.isArray(records) && records.length > 0;
+  } catch (err) {
+    // NXDOMAIN, no MX records, timeout, etc. — treat all as "can't receive mail"
+    return false;
+  }
+}
+
+function hashVerifyToken(rawToken) {
+  return crypto.createHash("sha256").update(rawToken).digest("hex");
+}
+
+// Creates + emails a fresh verification token for a given user, invalidating
+// any previous unused ones first. Used by both /api/register and
+// /api/resend-verification.
+async function sendNewVerificationEmail({ userId, email, fullName }) {
+  await pool.query("DELETE FROM email_verifications WHERE user_id = ? AND used_at IS NULL", [userId]);
+
+  const rawToken = crypto.randomBytes(32).toString("hex");
+  const tokenHash = hashVerifyToken(rawToken);
+  const expiresAt = new Date(Date.now() + VERIFY_TOKEN_EXPIRY_MS);
+
+  await pool.query(
+    "INSERT INTO email_verifications (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+    [userId, tokenHash, expiresAt]
+  );
+
+  const verifyUrl = `${process.env.FRONTEND_URL}/verify-email.html?token=${rawToken}`;
+
+  try {
+    await sendVerificationEmail({ to: email, customerName: fullName, verifyUrl });
+  } catch (emailErr) {
+    console.error("Verification email failed to send:", emailErr);
+  }
+}
+
+// Lightweight rate limiting for resend-verification, mirroring the
+// password-reset limiter below but kept separate/independent.
+const VERIFY_IP_WINDOW_MS = 15 * 60 * 1000;
+const VERIFY_IP_MAX_REQUESTS = 5;
+const VERIFY_EMAIL_COOLDOWN_MS = 60 * 1000;
+
+const verifyIpHits = new Map();
+const verifyEmailCooldowns = new Map();
+
+function isVerifyIpRateLimited(ip) {
+  const now = Date.now();
+  const hits = (verifyIpHits.get(ip) || []).filter(t => now - t < VERIFY_IP_WINDOW_MS);
+  verifyIpHits.set(ip, hits);
+  return hits.length >= VERIFY_IP_MAX_REQUESTS;
+}
+function recordVerifyIpRequest(ip) {
+  const hits = verifyIpHits.get(ip) || [];
+  hits.push(Date.now());
+  verifyIpHits.set(ip, hits);
+}
+function isVerifyEmailOnCooldown(email) {
+  const last = verifyEmailCooldowns.get(email);
+  return !!last && (Date.now() - last) < VERIFY_EMAIL_COOLDOWN_MS;
+}
+function recordVerifyEmailCooldown(email) {
+  verifyEmailCooldowns.set(email, Date.now());
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [email, ts] of verifyEmailCooldowns) {
+    if (now - ts > VERIFY_EMAIL_COOLDOWN_MS) verifyEmailCooldowns.delete(email);
+  }
+  for (const [ip, hits] of verifyIpHits) {
+    const fresh = hits.filter(t => now - t < VERIFY_IP_WINDOW_MS);
+    if (fresh.length === 0) verifyIpHits.delete(ip); else verifyIpHits.set(ip, fresh);
+  }
+}, 60 * 60 * 1000).unref();
+
+// ---------- Verify Email (the link the customer clicks) ----------
+app.get("/api/verify-email", async (req, res) => {
+  const token = req.query?.token;
+  if (!token) {
+    return res.status(400).json({ error: "This verification link is invalid or has expired. Please request a new one." });
+  }
+
+  try {
+    const tokenHash = hashVerifyToken(token);
+    const [rows] = await pool.query(
+      "SELECT * FROM email_verifications WHERE token_hash = ? AND used_at IS NULL AND expires_at > NOW() LIMIT 1",
+      [tokenHash]
+    );
+    if (rows.length === 0) {
+      return res.status(400).json({ error: "This verification link is invalid or has expired. Please request a new one." });
+    }
+
+    const record = rows[0];
+    await pool.query("UPDATE users SET email_verified_at = NOW() WHERE id = ?", [record.user_id]);
+    await pool.query("UPDATE email_verifications SET used_at = NOW() WHERE id = ?", [record.id]);
+    await pool.query("DELETE FROM email_verifications WHERE user_id = ? AND used_at IS NULL", [record.user_id]);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Something went wrong verifying your email." });
+  }
+});
+
+// ---------- Resend Verification Email ----------
+app.post("/api/resend-verification", async (req, res) => {
+  const ip = req.ip;
+  const GENERIC = { message: "If that email needs verifying, we've sent a new verification link." };
+
+  if (isVerifyIpRateLimited(ip)) {
+    return res.status(429).json({ error: "Too many requests. Please try again later." });
+  }
+  recordVerifyIpRequest(ip);
+
+  const email = (req.body?.email || "").trim();
+  if (!email) {
+    return res.status(400).json({ error: "Email is required." });
+  }
+
+  if (isVerifyEmailOnCooldown(email)) {
+    return res.json(GENERIC);
+  }
+  recordVerifyEmailCooldown(email);
+
+  try {
+    const [users] = await pool.query(
+      "SELECT id, full_name, email_verified_at FROM users WHERE email = ?",
+      [email]
+    );
+    if (users.length === 0 || users[0].email_verified_at) {
+      // Don't reveal whether the account exists or is already verified.
+      return res.json(GENERIC);
+    }
+
+    const user = users[0];
+    await sendNewVerificationEmail({ userId: user.id, email, fullName: user.full_name });
+
+    return res.json(GENERIC);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Something went wrong. Please try again." });
   }
 });
 
