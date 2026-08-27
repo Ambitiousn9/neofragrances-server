@@ -1,37 +1,48 @@
-// mailer.js — sends order confirmation and password-reset emails via Gmail
-const nodemailer = require("nodemailer");
+// mailer.js — sends order confirmation and password-reset emails via Resend
+//
+// WHY RESEND INSTEAD OF RAW SMTP: raw SMTP (Gmail, port 465/587) from
+// Render's free tier consistently times out (ETIMEDOUT on CONN) — the
+// TCP connection to Gmail's mail servers never completes, regardless of
+// port or IPv4/IPv6. This is a known pattern on PaaS free tiers, which
+// commonly restrict outbound SMTP while leaving normal HTTPS traffic
+// open. Resend sends over a plain HTTPS API call (port 443), which
+// sidesteps the problem entirely.
+//
+// No new npm dependency needed — this uses the same global `fetch()`
+// already used elsewhere in this project (see the Paystack calls in
+// server.js), just pointed at Resend's REST API instead.
 
-// IMPORTANT: using explicit host/port/secure (instead of the `service:
-// "gmail"` shorthand) plus `family: 4` to force IPv4. Some hosts (Render
-// included) intermittently fail to route IPv6 to Gmail's SMTP endpoint,
-// which surfaces as ETIMEDOUT on the initial connection — nothing to do
-// with credentials. Explicit timeouts also make failures fail fast and
-// log clearly instead of hanging.
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,
-  secure: false,   // STARTTLS on 587, not implicit TLS
-  requireTLS: true,
-  family: 4,        // force IPv4 — fixes ETIMEDOUT on some PaaS hosts
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_APP_PASSWORD,
-  },
-  connectionTimeout: 15000, // 15s — fail fast instead of hanging for minutes
-  greetingTimeout: 15000,
-  socketTimeout: 15000,
-});
+const RESEND_API_URL = "https://api.resend.com/emails";
 
-// Verify the SMTP connection once at startup so connectivity problems show
-// up immediately in the logs, rather than only when a customer triggers
-// an email.
-transporter.verify((err) => {
-  if (err) {
-    console.error("Mailer SMTP connection check failed:", err.message);
-  } else {
-    console.log("Mailer SMTP connection OK — ready to send email.");
+// Until a domain is verified in the Resend dashboard, Resend requires
+// sending FROM this sandbox address, and only allows sending TO the
+// email address the Resend account was signed up with. Once a domain is
+// verified (Resend → Domains), set RESEND_FROM_EMAIL to something like
+// "NeoFragrances <noreply@yourdomain.com>" — no code change needed.
+const FROM_EMAIL = process.env.RESEND_FROM_EMAIL || "NeoFragrances <onboarding@resend.dev>";
+
+async function sendViaResend({ to, subject, html }) {
+  const res = await fetch(RESEND_API_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: FROM_EMAIL,
+      to,
+      subject,
+      html,
+    }),
+  });
+
+  if (!res.ok) {
+    const errorBody = await res.text();
+    throw new Error(`Resend API error (${res.status}): ${errorBody}`);
   }
-});
+
+  return res.json();
+}
 
 async function sendOrderConfirmation({ to, customerName, orderId, items, total }) {
   const itemRows = items.map(item => `
@@ -65,8 +76,7 @@ async function sendOrderConfirmation({ to, customerName, orderId, items, total }
     </div>
   </div>`;
 
-  await transporter.sendMail({
-    from: `"NeoFragrances" <${process.env.EMAIL_USER}>`,
+  await sendViaResend({
     to,
     subject: `Order Confirmation — #${orderId}`,
     html,
@@ -110,8 +120,7 @@ async function sendPasswordResetEmail({ to, customerName, resetUrl }) {
     </div>
   </div>`;
 
-  await transporter.sendMail({
-    from: `"NeoFragrances" <${process.env.EMAIL_USER}>`,
+  await sendViaResend({
     to,
     subject: "Reset Your NeoFragrances Password",
     html,
