@@ -525,9 +525,20 @@ app.patch("/api/admin/products/:id/stock", requireAdmin, async (req, res) => {
 app.get("/api/admin/orders", requireAdmin, async (req, res) => {
   try {
     const [orders] = await pool.query(`
-      SELECT orders.*, users.full_name AS customer_name, users.email AS customer_email
+      SELECT orders.*,
+             users.full_name AS customer_name,
+             users.email AS customer_email,
+             users.phone AS customer_phone,
+             addresses.full_name AS delivery_name,
+             addresses.phone AS delivery_phone,
+             addresses.address_line1,
+             addresses.address_line2,
+             addresses.city,
+             addresses.region,
+             addresses.country
       FROM orders
       JOIN users ON orders.user_id = users.id
+      LEFT JOIN addresses ON orders.address_id = addresses.id
       ORDER BY orders.created_at DESC
     `);
     const [itemCounts] = await pool.query(`
@@ -562,7 +573,7 @@ app.patch("/api/admin/orders/:id/status", requireAdmin, async (req, res) => {
 app.get("/api/admin/customers", requireAdmin, async (req, res) => {
   try {
     const [customers] = await pool.query(`
-      SELECT users.id, users.full_name, users.email, users.created_at,
+      SELECT users.id, users.full_name, users.email, users.phone, users.created_at,
              COUNT(orders.id) AS order_count
       FROM users
       LEFT JOIN orders ON orders.user_id = users.id
