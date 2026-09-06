@@ -463,15 +463,15 @@ function requireAdmin(req, res, next) {
 
 // ---------- Admin: Create Product ----------
 app.post("/api/admin/products", requireAdmin, async (req, res) => {
-  const { name, brand, category, price, stock_qty, badge, image, top_notes, middle_notes, base_notes } = req.body;
+  const { name, brand, category, price, stock_qty, badge, image, description, top_notes, middle_notes, base_notes } = req.body;
   if (!name || !brand || !category || price == null) {
     return res.status(400).json({ error: "Name, brand, category, and price are required." });
   }
   try {
     const [result] = await pool.query(
-      `INSERT INTO products (name, brand, category, price, stock_qty, badge, image, top_notes, middle_notes, base_notes)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [name, brand, category, price, stock_qty || 0, badge || null, image || null, top_notes || null, middle_notes || null, base_notes || null]
+      `INSERT INTO products (name, brand, category, price, stock_qty, badge, image, description, top_notes, middle_notes, base_notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [name, brand, category, price, stock_qty || 0, badge || null, image || null, description || null, top_notes || null, middle_notes || null, base_notes || null]
     );
     res.status(201).json({ id: result.insertId });
   } catch (err) {
@@ -482,11 +482,11 @@ app.post("/api/admin/products", requireAdmin, async (req, res) => {
 
 // ---------- Admin: Update Product ----------
 app.put("/api/admin/products/:id", requireAdmin, async (req, res) => {
-  const { name, brand, category, price, stock_qty, badge, image, top_notes, middle_notes, base_notes } = req.body;
+  const { name, brand, category, price, stock_qty, badge, image, description, top_notes, middle_notes, base_notes } = req.body;
   try {
     await pool.query(
-      `UPDATE products SET name=?, brand=?, category=?, price=?, stock_qty=?, badge=?, image=?, top_notes=?, middle_notes=?, base_notes=? WHERE id=?`,
-      [name, brand, category, price, stock_qty, badge || null, image, top_notes, middle_notes, base_notes, req.params.id]
+      `UPDATE products SET name=?, brand=?, category=?, price=?, stock_qty=?, badge=?, image=?, description=?, top_notes=?, middle_notes=?, base_notes=? WHERE id=?`,
+      [name, brand, category, price, stock_qty, badge || null, image, description || null, top_notes, middle_notes, base_notes, req.params.id]
     );
     res.json({ success: true });
   } catch (err) {
@@ -715,17 +715,6 @@ app.post("/api/addresses", requireAuth, async (req, res) => {
 // ============================================================
 // ---------- Email Verification (real, email-based flow) -----
 // ============================================================
-//
-// Same security pattern as password reset below: only a SHA-256 hash of
-// the token is stored, tokens are single-use (used_at) and expire (24h —
-// longer than password reset since this is lower-risk and people often
-// don't check email right away after signing up).
-//
-// IMPORTANT — existing accounts: a migration (see migration-email-
-// verification.sql) sets email_verified_at = created_at for every
-// account that existed before this feature shipped, so no current
-// customer gets locked out. Only accounts created from here forward
-// need to click the link.
 
 const VERIFY_TOKEN_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -736,7 +725,6 @@ async function domainHasMailServer(email) {
     const records = await dns.resolveMx(domain);
     return Array.isArray(records) && records.length > 0;
   } catch (err) {
-    // NXDOMAIN, no MX records, timeout, etc. — treat all as "can't receive mail"
     return false;
   }
 }
@@ -745,9 +733,6 @@ function hashVerifyToken(rawToken) {
   return crypto.createHash("sha256").update(rawToken).digest("hex");
 }
 
-// Creates + emails a fresh verification token for a given user, invalidating
-// any previous unused ones first. Used by both /api/register and
-// /api/resend-verification.
 async function sendNewVerificationEmail({ userId, email, fullName }) {
   await pool.query("DELETE FROM email_verifications WHERE user_id = ? AND used_at IS NULL", [userId]);
 
@@ -769,8 +754,6 @@ async function sendNewVerificationEmail({ userId, email, fullName }) {
   }
 }
 
-// Lightweight rate limiting for resend-verification, mirroring the
-// password-reset limiter below but kept separate/independent.
 const VERIFY_IP_WINDOW_MS = 15 * 60 * 1000;
 const VERIFY_IP_MAX_REQUESTS = 5;
 const VERIFY_EMAIL_COOLDOWN_MS = 60 * 1000;
@@ -862,7 +845,6 @@ app.post("/api/resend-verification", async (req, res) => {
       [email]
     );
     if (users.length === 0 || users[0].email_verified_at) {
-      // Don't reveal whether the account exists or is already verified.
       return res.json(GENERIC);
     }
 
@@ -879,23 +861,6 @@ app.post("/api/resend-verification", async (req, res) => {
 // ============================================================
 // ---------- Password Reset (real, email-based flow) ---------
 // ============================================================
-//
-// Security design:
-//  - The raw token is sent ONLY by email, never in an API response.
-//  - Only a SHA-256 hash of the token is stored in the database, so a
-//    leaked/stolen database dump can't be used to reset accounts.
-//  - Tokens expire after 1 hour and are single-use (marked used_at,
-//    and re-checked with `used_at IS NULL` on every lookup).
-//  - Requesting a new link invalidates any previous unused links for
-//    that user.
-//  - The forgot-password endpoint always returns the same generic
-//    message, whether or not the email is registered, so it can't be
-//    used to enumerate accounts.
-//  - Lightweight in-memory rate limiting/cooldown guards against abuse.
-//    This resets if the server restarts and isn't shared across
-//    multiple server instances — fine for this project's scale, but a
-//    production deployment on multiple instances should move this to
-//    something shared (e.g. express-rate-limit backed by Redis/DB).
 
 const RESET_IP_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
 const RESET_IP_MAX_REQUESTS = 5;           // per IP, per window
@@ -922,7 +887,6 @@ function isEmailOnCooldown(email) {
 function recordEmailCooldown(email) {
   resetEmailCooldowns.set(email, Date.now());
 }
-// Periodic cleanup so these maps don't grow forever on a long-running process.
 setInterval(() => {
   const now = Date.now();
   for (const [email, ts] of resetEmailCooldowns) {
@@ -953,8 +917,6 @@ app.post("/api/forgot-password", async (req, res) => {
     return res.status(400).json({ error: "Email is required." });
   }
 
-  // Same-email cooldown: respond with the generic message either way,
-  // so a repeated submission never reveals whether the account exists.
   if (isEmailOnCooldown(email)) {
     return res.json(GENERIC);
   }
@@ -968,8 +930,6 @@ app.post("/api/forgot-password", async (req, res) => {
 
     const user = users[0];
 
-    // Invalidate any previous unused reset tokens for this user before
-    // issuing a new one.
     await pool.query("DELETE FROM password_resets WHERE user_id = ? AND used_at IS NULL", [user.id]);
 
     const rawToken = crypto.randomBytes(32).toString("hex");
@@ -986,8 +946,6 @@ app.post("/api/forgot-password", async (req, res) => {
     try {
       await sendPasswordResetEmail({ to: email, customerName: user.full_name, resetUrl });
     } catch (emailErr) {
-      // Never surface email-delivery failures to the client — that would
-      // leak whether the account exists, and could expose infra details.
       console.error("Password reset email failed to send:", emailErr);
     }
 
@@ -1043,8 +1001,6 @@ app.post("/api/reset-password", async (req, res) => {
 
     await pool.query("UPDATE users SET password_hash = ? WHERE id = ?", [passwordHash, resetRecord.user_id]);
 
-    // Mark this token used (audit trail) and clear out any other stray
-    // unused tokens for this user so the link can never be reused.
     await pool.query("UPDATE password_resets SET used_at = NOW() WHERE id = ?", [resetRecord.id]);
     await pool.query("DELETE FROM password_resets WHERE user_id = ? AND used_at IS NULL", [resetRecord.user_id]);
 
@@ -1121,11 +1077,13 @@ app.post("/api/payments/initialize", requireAuth, async (req, res) => {
         discount = Math.min(discount, total);
       }
     }
+
+    // Shipping fee is intentionally still applied here — the shipping-fee
+    // fix has been held off for now at the site owner's request.
     const shipping = total > 0 ? 8 : 0;
     const finalTotal = total - discount + shipping;
     const reference = `NF-${Date.now()}-${req.user.id}`;
 
-    console.log("Callback URL being sent to Paystack:", `${process.env.FRONTEND_URL}/payment-callback.html`);
     const paystackRes = await fetch("https://api.paystack.co/transaction/initialize", {
       method: "POST",
       headers: {
@@ -1226,7 +1184,6 @@ app.get("/api/payments/verify/:reference", requireAuth, async (req, res) => {
 
       await connection.commit();
 
-      // Send the confirmation email — wrapped so a failed email never breaks the order itself
       try {
         const [userRows] = await pool.query("SELECT full_name, email FROM users WHERE id = ?", [userId]);
         if (userRows.length > 0) {
