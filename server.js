@@ -1212,6 +1212,188 @@ app.get("/api/payments/verify/:reference", requireAuth, async (req, res) => {
   }
 });
 
+// ============================================================
+// ---------- Special Offers ----------------------------------
+// ============================================================
+//
+// Offers are the single source of truth for promotional pricing.
+// Status (Scheduled / Active / Expired / Disabled) is NEVER stored —
+// it's always derived from start_at/end_at/active at read time, so
+// the Admin Portal and the customer-facing page can never disagree
+// about whether an offer is currently live. This also means an
+// offer expires automatically the instant its end_at passes, with
+// no cron job or manual step required.
+
+function computeOfferStatus(offer) {
+  const now = new Date();
+  const start = new Date(offer.start_at);
+  const end = new Date(offer.end_at);
+  if (now < start) return "Scheduled";
+  if (now >= end) return "Expired";
+  if (!offer.active) return "Disabled";
+  return "Active";
+}
+
+function attachOfferPricing(offer) {
+  const original = Number(offer.original_price);
+  const sale = Number(offer.sale_price);
+  const discount_percent = original > 0 ? Math.round(((original - sale) / original) * 100) : 0;
+  return { ...offer, original_price: original, sale_price: sale, discount_percent };
+}
+
+// ---------- Public: currently-active offers, for special-offers.html ----------
+app.get("/api/offers/active", async (req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT offers.id, offers.title, offers.description, offers.offer_type, offers.badge,
+             offers.image, offers.start_at, offers.end_at, offers.featured, offers.display_order,
+             offer_products.original_price, offer_products.sale_price,
+             products.id AS product_id, products.name AS product_name, products.brand,
+             products.category, products.image AS product_image, products.stock_qty,
+             products.avg_rating, products.review_count
+      FROM offers
+      JOIN offer_products ON offer_products.offer_id = offers.id
+      JOIN products ON offer_products.product_id = products.id
+      WHERE offers.active = 1
+        AND NOW() >= offers.start_at
+        AND NOW() < offers.end_at
+        AND products.deleted_at IS NULL
+      ORDER BY offers.featured DESC, offers.display_order ASC, offers.created_at DESC
+    `);
+    res.json(rows.map(attachOfferPricing));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not fetch active offers." });
+  }
+});
+
+// ---------- Admin: all offers (any status), for the management table ----------
+app.get("/api/admin/offers", requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT offers.*,
+             offer_products.original_price, offer_products.sale_price,
+             products.id AS product_id, products.name AS product_name, products.image AS product_image
+      FROM offers
+      LEFT JOIN offer_products ON offer_products.offer_id = offers.id
+      LEFT JOIN products ON offer_products.product_id = products.id
+      ORDER BY offers.display_order ASC, offers.created_at DESC
+    `);
+    const withStatus = rows.map(o => attachOfferPricing({ ...o, status: computeOfferStatus(o) }));
+    res.json(withStatus);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not fetch offers." });
+  }
+});
+
+// ---------- Admin: create offer ----------
+app.post("/api/admin/offers", requireAdmin, async (req, res) => {
+  const {
+    title, description, offer_type, badge, image,
+    start_at, end_at, active, featured, display_order,
+    product_id, original_price, sale_price,
+  } = req.body;
+
+  if (!title || !start_at || !end_at || !product_id || original_price == null || sale_price == null) {
+    return res.status(400).json({ error: "Title, product, dates, and both prices are required." });
+  }
+  if (Number(sale_price) > Number(original_price)) {
+    return res.status(400).json({ error: "Sale price cannot be higher than the original price." });
+  }
+  if (new Date(end_at) <= new Date(start_at)) {
+    return res.status(400).json({ error: "End date must be after the start date." });
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [offerResult] = await connection.query(
+      `INSERT INTO offers (title, description, offer_type, badge, image, start_at, end_at, active, featured, display_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [title, description || null, offer_type || "discount", badge || null, image || null,
+       start_at, end_at, active === false ? 0 : 1, featured ? 1 : 0, display_order || 0]
+    );
+    const offerId = offerResult.insertId;
+    await connection.query(
+      `INSERT INTO offer_products (offer_id, product_id, original_price, sale_price) VALUES (?, ?, ?, ?)`,
+      [offerId, product_id, original_price, sale_price]
+    );
+    await connection.commit();
+    res.status(201).json({ id: offerId });
+  } catch (err) {
+    await connection.rollback();
+    console.error(err);
+    res.status(500).json({ error: "Could not create offer." });
+  } finally {
+    connection.release();
+  }
+});
+
+// ---------- Admin: update offer ----------
+app.put("/api/admin/offers/:id", requireAdmin, async (req, res) => {
+  const {
+    title, description, offer_type, badge, image,
+    start_at, end_at, active, featured, display_order,
+    product_id, original_price, sale_price,
+  } = req.body;
+
+  if (Number(sale_price) > Number(original_price)) {
+    return res.status(400).json({ error: "Sale price cannot be higher than the original price." });
+  }
+  if (new Date(end_at) <= new Date(start_at)) {
+    return res.status(400).json({ error: "End date must be after the start date." });
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    await connection.query(
+      `UPDATE offers SET title=?, description=?, offer_type=?, badge=?, image=?, start_at=?, end_at=?, active=?, featured=?, display_order=? WHERE id=?`,
+      [title, description || null, offer_type || "discount", badge || null, image || null,
+       start_at, end_at, active === false ? 0 : 1, featured ? 1 : 0, display_order || 0, req.params.id]
+    );
+    // Single-product-per-offer for now (schema supports more later) —
+    // replace the offer's product/price row rather than trying to diff it.
+    await connection.query(`DELETE FROM offer_products WHERE offer_id = ?`, [req.params.id]);
+    await connection.query(
+      `INSERT INTO offer_products (offer_id, product_id, original_price, sale_price) VALUES (?, ?, ?, ?)`,
+      [req.params.id, product_id, original_price, sale_price]
+    );
+    await connection.commit();
+    res.json({ success: true });
+  } catch (err) {
+    await connection.rollback();
+    console.error(err);
+    res.status(500).json({ error: "Could not update offer." });
+  } finally {
+    connection.release();
+  }
+});
+
+// ---------- Admin: activate/deactivate (toggle the manual "active" flag) ----------
+app.patch("/api/admin/offers/:id/toggle", requireAdmin, async (req, res) => {
+  const { active } = req.body;
+  try {
+    await pool.query(`UPDATE offers SET active = ? WHERE id = ?`, [active ? 1 : 0, req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not update offer status." });
+  }
+});
+
+// ---------- Admin: delete offer ----------
+app.delete("/api/admin/offers/:id", requireAdmin, async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM offers WHERE id = ?`, [req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not delete offer." });
+  }
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`NeoFragrances API running at http://localhost:${PORT}`);
