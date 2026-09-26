@@ -58,6 +58,97 @@ function requireAuth(req, res, next) {
   }
 }
 
+// ---------- Auth middleware: admin-only routes ----------
+function requireAdmin(req, res, next) {
+  requireAuth(req, res, () => {
+    if (req.user.role !== "admin") {
+      return res.status(403).json({ error: "Admin access only." });
+    }
+    next();
+  });
+}
+
+// ============================================================
+// ---------- Special Offers: shared pricing helpers ----------
+// ============================================================
+//
+// Status (Scheduled / Active / Expired / Disabled) is NEVER stored — it's
+// always derived from start_at/end_at/active at read time, so the Admin
+// Portal, the public offers list, and this pricing check can never
+// disagree about whether an offer is currently live.
+//
+// getApplicablePrice() is the SINGLE source of truth for "what does this
+// product actually cost right now, optionally under this offer." It is
+// used identically by /api/checkout, /api/payments/initialize, and
+// /api/payments/verify/:reference, so the cart, the checkout total, and
+// the saved order can never disagree about price. It NEVER trusts a
+// price sent by the client — only a productId and (optionally) an
+// offerId, both of which are re-validated against the database here.
+
+function computeOfferStatus(offer) {
+  const now = new Date();
+  const start = new Date(offer.start_at);
+  const end = new Date(offer.end_at);
+  if (now < start) return "Scheduled";
+  if (now >= end) return "Expired";
+  if (!offer.active) return "Disabled";
+  return "Active";
+}
+
+function attachOfferPricing(offer) {
+  const original = Number(offer.original_price);
+  const sale = Number(offer.sale_price);
+  const discount_percent = original > 0 ? Math.round(((original - sale) / original) * 100) : 0;
+  return { ...offer, original_price: original, sale_price: sale, discount_percent };
+}
+
+/**
+ * Resolves the current, authoritative unit price for a product.
+ *
+ * - `db` is either `pool` or an open transaction `connection` — both
+ *   expose the same `.query()` signature, so this works inside or
+ *   outside a transaction transparently.
+ * - `offerId` is only ever treated as a HINT of which offer the customer
+ *   believes applies (e.g. because they added the item from the Special
+ *   Offers page). It is independently verified against the offers/
+ *   offer_products tables and the offer's live time window before ever
+ *   being honored. If the offer doesn't exist, doesn't apply to this
+ *   product, or isn't currently Active (expired/disabled/scheduled/
+ *   deleted), this silently falls back to the product's regular price —
+ *   callers can compare the requested `offerId` against the returned
+ *   `appliedOfferId` to detect that and warn the customer before payment.
+ *
+ * Returns null if the product doesn't exist or has been soft-deleted.
+ */
+async function getApplicablePrice(db, productId, offerId) {
+  const [productRows] = await db.query(
+    "SELECT id, name, price, stock_qty FROM products WHERE id = ? AND deleted_at IS NULL",
+    [productId]
+  );
+  if (productRows.length === 0) return null;
+  const product = productRows[0];
+
+  let price = Number(product.price);
+  let appliedOfferId = null;
+
+  if (offerId) {
+    const [offerRows] = await db.query(
+      `SELECT offers.id, offers.active, offers.start_at, offers.end_at, offer_products.sale_price
+       FROM offers
+       JOIN offer_products ON offer_products.offer_id = offers.id
+       WHERE offers.id = ? AND offer_products.product_id = ?
+       LIMIT 1`,
+      [offerId, productId]
+    );
+    if (offerRows.length > 0 && computeOfferStatus(offerRows[0]) === "Active") {
+      price = Number(offerRows[0].sale_price);
+      appliedOfferId = offerRows[0].id;
+    }
+  }
+
+  return { price, stockQty: product.stock_qty, name: product.name, appliedOfferId };
+}
+
 // ---------- Products ----------
 app.get("/api/products", async (req, res) => {
   try {
@@ -283,7 +374,7 @@ app.post("/api/auth/google", async (req, res) => {
 });
 // ---------- Checkout ----------
 app.post("/api/checkout", requireAuth, async (req, res) => {
-  const { items, addressId, couponId } = req.body; // [{ productId, qty }], addressId, couponId
+  const { items, addressId, couponId } = req.body; // [{ productId, qty, offerId }], addressId, couponId
 
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: "Your cart is empty." });
@@ -293,23 +384,18 @@ app.post("/api/checkout", requireAuth, async (req, res) => {
   try {
     await connection.beginTransaction();
 
-    const ids = items.map(i => i.productId);
-    const [products] = await connection.query(
-      `SELECT id, price, stock_qty FROM products WHERE id IN (?) AND deleted_at IS NULL`,
-      [ids]
-    );
-
+    // Price every line item from the DB (products + any valid offer) —
+    // never trust what the client sent.
     let total = 0;
     const itemDetails = [];
     for (const item of items) {
-      const product = products.find(p => Number(p.id) === Number(item.productId));
-      if (!product) {
-          console.error("Product mismatch — item.productId:", item.productId, "available product IDs:", products.map(p => p.id));
-          throw new Error("One of the items in your order is no longer available.");
-        }
-      if (product.stock_qty < item.qty) throw new Error(`Not enough stock for one of the items in your cart.`);
-      total += Number(product.price) * item.qty;
-      itemDetails.push({ productId: item.productId, qty: item.qty, price: product.price });
+      const priced = await getApplicablePrice(connection, item.productId, item.offerId || null);
+      if (!priced) {
+        throw new Error("One of the items in your order is no longer available.");
+      }
+      if (priced.stockQty < item.qty) throw new Error(`Not enough stock for one of the items in your cart.`);
+      total += priced.price * item.qty;
+      itemDetails.push({ productId: item.productId, qty: item.qty, price: priced.price });
     }
 
     let discount = 0;
@@ -451,15 +537,6 @@ app.post("/api/track-order", async (req, res) => {
     });
   }
 });
-// ---------- Auth middleware: admin-only routes ----------
-function requireAdmin(req, res, next) {
-  requireAuth(req, res, () => {
-    if (req.user.role !== "admin") {
-      return res.status(403).json({ error: "Admin access only." });
-    }
-    next();
-  });
-}
 
 // ---------- Admin: Create Product ----------
 app.post("/api/admin/products", requireAdmin, async (req, res) => {
@@ -1042,7 +1119,7 @@ app.post("/api/coupons/validate", async (req, res) => {
 
 // ---------- Payments (Paystack) ----------
 app.post("/api/payments/initialize", requireAuth, async (req, res) => {
-  const { items, addressId, couponId } = req.body;
+  const { items, addressId, couponId } = req.body; // items: [{ productId, qty, offerId }]
 
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: "Your cart is empty." });
@@ -1053,18 +1130,29 @@ app.post("/api/payments/initialize", requireAuth, async (req, res) => {
     if (userRows.length === 0) return res.status(404).json({ error: "User not found." });
     const email = userRows[0].email;
 
-    const ids = items.map(i => i.productId);
-    const [products] = await pool.query(
-      `SELECT id, price, stock_qty FROM products WHERE id IN (?) AND deleted_at IS NULL`,
-      [ids]
-    );
-
+    // Price every line item from the DB — never trust a price from the
+    // client. If the customer expected an offer (offerId set) but that
+    // offer is no longer valid (expired/disabled since they added it),
+    // flag it and stop BEFORE sending them to pay, rather than silently
+    // charging a different amount.
     let total = 0;
+    const priceChangedItems = [];
     for (const item of items) {
-      const product = products.find(p => p.id === item.productId);
-      if (!product) return res.status(400).json({ error: "One of the items in your cart is no longer available." });
-      if (product.stock_qty < item.qty) return res.status(400).json({ error: "Not enough stock for one of the items in your cart." });
-      total += Number(product.price) * item.qty;
+      const priced = await getApplicablePrice(pool, item.productId, item.offerId || null);
+      if (!priced) return res.status(400).json({ error: "One of the items in your cart is no longer available." });
+      if (priced.stockQty < item.qty) return res.status(400).json({ error: "Not enough stock for one of the items in your cart." });
+      if (item.offerId && !priced.appliedOfferId) {
+        priceChangedItems.push({ productId: item.productId, name: priced.name, newPrice: priced.price });
+      }
+      total += priced.price * item.qty;
+    }
+
+    if (priceChangedItems.length > 0) {
+      return res.status(409).json({
+        error: "One or more items in your cart changed price — a special offer may have expired. Please review your cart before paying.",
+        priceChanged: true,
+        items: priceChangedItems,
+      });
     }
 
     let discount = 0;
@@ -1128,27 +1216,29 @@ app.get("/api/payments/verify/:reference", requireAuth, async (req, res) => {
       return res.json({ orderId: existing[0].id, total: existing[0].total, alreadyProcessed: true });
     }
 
-    const { items, addressId, couponId, userId } = verifyData.data.metadata;
+    const { items, addressId, couponId, userId } = verifyData.data.metadata; // items: [{ productId, qty, offerId }]
     const connection = await pool.getConnection();
     try {
       await connection.beginTransaction();
 
-      const ids = items.map(i => i.productId);
-      const [products] = await connection.query(
-        `SELECT id, name, price, stock_qty FROM products WHERE id IN (?) AND deleted_at IS NULL`,
-        [ids]
-      );
-
+      // Re-derive every line's price at order-creation time too — the
+      // same rule as initialize, applied again in case anything changed
+      // in the (usually very short) gap between starting and completing
+      // payment. NOTE (pre-existing behavior, unchanged by this fix):
+      // this recomputes independently of the amount Paystack actually
+      // charged, same as it already did for regular prices before this
+      // fix — it does not re-charge the customer, only prices the saved
+      // order record. A price changing again in this narrow window is a
+      // rare, pre-existing edge case, not something newly introduced here.
       let total = 0;
       const itemDetails = [];
       for (const item of items) {
-        const product = products.find(p => Number(p.id) === Number(item.productId));
-        if (!product) {
-          console.error("Product mismatch — item.productId:", item.productId, "available product IDs:", products.map(p => p.id));
+        const priced = await getApplicablePrice(connection, item.productId, item.offerId || null);
+        if (!priced) {
           throw new Error("One of the items in your order is no longer available.");
         }
-        total += Number(product.price) * item.qty;
-        itemDetails.push({ productId: item.productId, qty: item.qty, price: product.price, name: product.name });
+        total += priced.price * item.qty;
+        itemDetails.push({ productId: item.productId, qty: item.qty, price: priced.price, name: priced.name });
       }
 
       let discount = 0;
@@ -1215,31 +1305,6 @@ app.get("/api/payments/verify/:reference", requireAuth, async (req, res) => {
 // ============================================================
 // ---------- Special Offers ----------------------------------
 // ============================================================
-//
-// Offers are the single source of truth for promotional pricing.
-// Status (Scheduled / Active / Expired / Disabled) is NEVER stored —
-// it's always derived from start_at/end_at/active at read time, so
-// the Admin Portal and the customer-facing page can never disagree
-// about whether an offer is currently live. This also means an
-// offer expires automatically the instant its end_at passes, with
-// no cron job or manual step required.
-
-function computeOfferStatus(offer) {
-  const now = new Date();
-  const start = new Date(offer.start_at);
-  const end = new Date(offer.end_at);
-  if (now < start) return "Scheduled";
-  if (now >= end) return "Expired";
-  if (!offer.active) return "Disabled";
-  return "Active";
-}
-
-function attachOfferPricing(offer) {
-  const original = Number(offer.original_price);
-  const sale = Number(offer.sale_price);
-  const discount_percent = original > 0 ? Math.round(((original - sale) / original) * 100) : 0;
-  return { ...offer, original_price: original, sale_price: sale, discount_percent };
-}
 
 // ---------- Public: currently-active offers, for special-offers.html ----------
 app.get("/api/offers/active", async (req, res) => {
