@@ -58,6 +58,7 @@ function requireAuth(req, res, next) {
   }
 }
 
+
 // ---------- Auth middleware: admin-only routes ----------
 function requireAdmin(req, res, next) {
   requireAuth(req, res, () => {
