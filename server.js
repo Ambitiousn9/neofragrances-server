@@ -150,17 +150,94 @@ async function getApplicablePrice(db, productId, offerId) {
 }
 
 // ---------- Products ----------
+// PATCH: this endpoint now optionally supports pagination + filtering.
+// Called with NO query params (as it always has been by every page that
+// needs the full catalog — cart, wishlist, product-details, admin, "Buy
+// Again"), it behaves exactly as before: a plain full array, unchanged.
+//
+// Called WITH ?page=&limit= (only products.html's catalog browser does
+// this), it instead returns { products, currentPage, perPage,
+// totalProducts, totalPages } for exactly one page of real, filtered,
+// server-side LIMIT/OFFSET results — the catalog is never loaded whole
+// just to slice it in JavaScript.
 app.get("/api/products", async (req, res) => {
+  const { page, limit, search, category, brand, price, sort } = req.query;
+  const isPaginated = page != null || limit != null;
+
+  if (!isPaginated) {
+    try {
+      const [rows] = await pool.query(
+        "SELECT * FROM products WHERE deleted_at IS NULL"
+      );
+      res.json(rows);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Something went wrong fetching products." });
+    }
+    return;
+  }
+
   try {
-    const [rows] = await pool.query(
-      "SELECT * FROM products WHERE deleted_at IS NULL"
+    const where = ["deleted_at IS NULL"];
+    const params = [];
+
+    if (search) {
+      where.push("(name LIKE ? OR brand LIKE ?)");
+      params.push(`%${search}%`, `%${search}%`);
+    }
+    if (category && category !== "all") {
+      where.push("category = ?");
+      params.push(category);
+    }
+    if (brand && brand !== "all") {
+      where.push("brand = ?");
+      params.push(brand);
+    }
+    if (price === "under100") {
+      where.push("price < 100");
+    } else if (price === "100to130") {
+      where.push("price BETWEEN 100 AND 130");
+    } else if (price === "over130") {
+      where.push("price > 130");
+    }
+
+    const whereSql = where.join(" AND ");
+
+    const [countRows] = await pool.query(
+      `SELECT COUNT(*) AS total FROM products WHERE ${whereSql}`,
+      params
     );
-    res.json(rows);
+    const totalProducts = countRows[0].total;
+
+    const perPage = Math.max(1, Math.min(60, Number(limit) || 12));
+    const totalPages = Math.max(1, Math.ceil(totalProducts / perPage));
+    let currentPage = Number(page) || 1;
+    if (currentPage < 1) currentPage = 1;
+    if (currentPage > totalPages) currentPage = totalPages;
+    const offset = (currentPage - 1) * perPage;
+
+    // A stable tiebreaker (id ASC) is always appended so the same
+    // LIMIT/OFFSET always returns the same rows regardless of sort —
+    // without one, MySQL doesn't guarantee row order across requests,
+    // which would silently corrupt pagination between pages.
+    let orderBy = "id ASC";
+    if (sort === "price-low") orderBy = "price ASC, id ASC";
+    else if (sort === "price-high") orderBy = "price DESC, id ASC";
+    else if (sort === "newest") orderBy = "(badge = 'New') DESC, id ASC";
+    else if (sort === "popular") orderBy = "(badge = 'Bestseller') DESC, id ASC";
+
+    const [rows] = await pool.query(
+      `SELECT * FROM products WHERE ${whereSql} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
+      [...params, perPage, offset]
+    );
+
+    res.json({ products: rows, currentPage, perPage, totalProducts, totalPages });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Something went wrong fetching products." });
   }
 });
+
 
 // ---------- Register ----------
 app.post("/api/register", async (req, res) => {
